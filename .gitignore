@@ -9,7 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-# HuggingFace model cache
+# Model files (downloaded locally)
+models/
 .cache/
 
 # IDE
