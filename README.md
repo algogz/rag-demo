@@ -80,6 +80,10 @@ uv run python img-search.py search "a sunset over the ocean"
 
 # Vector search only (skip reranking)
 uv run python img-search.py search "风景照片" --no-rerank --top-k 10
+
+# Web UI (text and image query, click to expand)
+uv run python img-search.py serve
+uv run python img-search.py serve --port 8080 --no-rerank
 ```
 
 ## Options
@@ -112,3 +116,5 @@ uv run python img-search.py search "风景照片" --no-rerank --top-k 10
 | `embed <path>` | — | Embed images from file or directory (skips already embedded) |
 | `search <desc>` | `--top-k N` | Search with reranking (default top-k: 20) |
 | `search <desc>` | `--no-rerank` | Vector similarity only, skip reranker |
+| `serve` | `--port N` | Launch web UI (default port: 7860) |
+| `serve` | `--no-rerank` | Skip reranking in web UI |
