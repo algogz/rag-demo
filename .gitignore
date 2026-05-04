@@ -18,5 +18,8 @@ models/
 .vscode/
 *.swp
 
+# Database
+*.db
+
 # OS
 .DS_Store
