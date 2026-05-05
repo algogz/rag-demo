@@ -13,6 +13,8 @@ import os
 import sqlite3
 import struct
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +38,24 @@ def model_path(model_id: str) -> str:
         return str(local)
     os.makedirs(MODEL_DIR, exist_ok=True)
     return model_id
+
+
+def resolve_device(device: str | None = None) -> str:
+    """Resolve the best available device. Priority: user-specified > cuda > mps > cpu."""
+    if device:
+        return device
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _model_dtype(device: str):
+    """Use float16 on GPU/MPS for faster inference, float32 on CPU."""
+    import torch
+    return torch.float16 if device in ("cuda", "mps") else torch.float32
 
 
 def serialize_f32(vector: np.ndarray) -> bytes:
@@ -79,8 +99,11 @@ def scan_images(path: str) -> list[Path]:
 # ─── Embed Command ──────────────────────────────────────────────────────────────
 
 
-def cmd_embed(path: str):
+def cmd_embed(path: str, device: str | None = None):
     from sentence_transformers import SentenceTransformer
+
+    dev = resolve_device(device)
+    print(f"Device: {dev}")
 
     images = scan_images(path)
     if not images:
@@ -102,7 +125,7 @@ def cmd_embed(path: str):
 
     mp = model_path(EMBEDDING_MODEL_ID)
     print(f"Loading embedding model from: {mp} ...")
-    model = SentenceTransformer(mp, cache_folder=str(MODEL_DIR))
+    model = SentenceTransformer(mp, cache_folder=str(MODEL_DIR), device=dev, model_kwargs={"torch_dtype": _model_dtype(dev)})
 
     from PIL import Image
 
@@ -158,12 +181,26 @@ def _knn_search(query_vec: np.ndarray, top_k: int) -> list[tuple]:
     return rows
 
 
-def _rerank(query, rows: list[tuple], reranker) -> list[tuple[float, str, str]]:
-    """Rerank results. Returns list of (score, path, filename)."""
+_RERANK_MAX_PIXELS = 147456  # ~384x384, enough for relevance scoring
+
+
+def _resize_for_rerank(img) -> "Image.Image":
+    """Resize image so total pixels <= _RERANK_MAX_PIXELS, keeping aspect ratio."""
+    w, h = img.size
+    if w * h <= _RERANK_MAX_PIXELS:
+        return img
+    import math
+    scale = math.sqrt(_RERANK_MAX_PIXELS / (w * h))
+    return img.resize((int(w * scale), int(h * scale)))
+
+
+def _rerank(query, rows: list[tuple], reranker, rerank_k: int = 10) -> list[tuple[float, str, str]]:
+    """Rerank top-N results. Returns list of (score, path, filename)."""
     from PIL import Image
 
-    pairs = [(query, Image.open(row[2])) for row in rows]
-    raw_scores = reranker.predict(pairs)
+    candidates = rows[:rerank_k]
+    pairs = [(query, _resize_for_rerank(Image.open(row[2]))) for row in candidates]
+    raw_scores = reranker.predict(pairs, batch_size=1)
 
     if hasattr(raw_scores, "tolist"):
         raw_scores = raw_scores.tolist()
@@ -175,7 +212,7 @@ def _rerank(query, rows: list[tuple], reranker) -> list[tuple[float, str, str]]:
         scores = [1.0 for _ in flat]
 
     ranked = sorted(
-        zip(scores, rows, strict=True),
+        zip(scores, candidates, strict=True),
         key=lambda x: x[0],
         reverse=True,
     )
@@ -194,8 +231,11 @@ def _distance_scores(rows: list[tuple]) -> list[tuple[float, str, str]]:
 # ─── Search Command ─────────────────────────────────────────────────────────────
 
 
-def cmd_search(query: str, top_k: int = 20, no_rerank: bool = False):
+def cmd_search(query: str, top_k: int = 20, no_rerank: bool = False, device: str | None = None):
     from sentence_transformers import CrossEncoder, SentenceTransformer
+
+    dev = resolve_device(device)
+    print(f"Device: {dev}")
 
     db = init_db()
     total = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
@@ -206,7 +246,7 @@ def cmd_search(query: str, top_k: int = 20, no_rerank: bool = False):
 
     mp = model_path(EMBEDDING_MODEL_ID)
     print(f"Loading embedding model from: {mp} ...")
-    embed_model = SentenceTransformer(mp, cache_folder=str(MODEL_DIR))
+    embed_model = SentenceTransformer(mp, cache_folder=str(MODEL_DIR), device=dev, model_kwargs={"torch_dtype": _model_dtype(dev)})
 
     print(f"\nQuery: {query}")
     print(f"Database: {total} images")
@@ -224,7 +264,7 @@ def cmd_search(query: str, top_k: int = 20, no_rerank: bool = False):
     else:
         mp = model_path(RERANKER_MODEL_ID)
         print(f"Loading reranker model from: {mp} ...")
-        reranker = CrossEncoder(mp, cache_folder=str(MODEL_DIR))
+        reranker = CrossEncoder(mp, cache_folder=str(MODEL_DIR), device=dev, model_kwargs={"torch_dtype": _model_dtype(dev)})
         ranked = _rerank(query, rows, reranker)
 
     for rank, (score, path, filename) in enumerate(ranked, 1):
@@ -237,10 +277,13 @@ def cmd_search(query: str, top_k: int = 20, no_rerank: bool = False):
 # ─── Serve Command ─────────────────────────────────────────────────────────────
 
 
-def cmd_serve(port: int = 7860, no_rerank: bool = False):
+def cmd_serve(port: int = 7860, no_rerank: bool = False, device: str | None = None, rerank_k: int = 10):
     import gradio as gr
     from PIL import Image
     from sentence_transformers import SentenceTransformer
+
+    dev = resolve_device(device)
+    print(f"Device: {dev}")
 
     db = init_db()
     total = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
@@ -255,7 +298,7 @@ def cmd_serve(port: int = 7860, no_rerank: bool = False):
 
     mp = model_path(EMBEDDING_MODEL_ID)
     print(f"Loading embedding model from: {mp} ...")
-    embed_model = SentenceTransformer(mp, cache_folder=str(MODEL_DIR))
+    embed_model = SentenceTransformer(mp, cache_folder=str(MODEL_DIR), device=dev, model_kwargs={"torch_dtype": _model_dtype(dev)})
 
     reranker = None
     if not no_rerank:
@@ -263,11 +306,24 @@ def cmd_serve(port: int = 7860, no_rerank: bool = False):
 
         mp = model_path(RERANKER_MODEL_ID)
         print(f"Loading reranker model from: {mp} ...")
-        reranker = CrossEncoder(mp, cache_folder=str(MODEL_DIR))
+        reranker = CrossEncoder(mp, cache_folder=str(MODEL_DIR), device=dev, model_kwargs={"torch_dtype": _model_dtype(dev)})
+
+    heic_cache = Path(tempfile.mkdtemp(prefix="img_search_heic_"))
+
+    def _ensure_browser_compatible(path: str) -> str:
+        """Convert HEIC to JPEG for browser display; return original path otherwise."""
+        if Path(path).suffix.lower() != ".heic":
+            return path
+        jpeg_path = heic_cache / (Path(path).stem + ".jpg")
+        if not jpeg_path.exists():
+            Image.open(path).convert("RGB").save(jpeg_path, "JPEG", quality=90)
+        return str(jpeg_path)
 
     def do_search(text_query: str, image_file, top_k: int):
         if not text_query and image_file is None:
             return [], "Please enter a text query or upload an image."
+
+        t0 = time.perf_counter()
 
         # Build query vector
         if image_file is not None:
@@ -279,18 +335,28 @@ def cmd_serve(port: int = 7860, no_rerank: bool = False):
             [query_input], normalize_embeddings=True, show_progress_bar=False
         )
         query_vec = query_emb[0]
+        print(f"  [timing] embedding: {time.perf_counter() - t0:.3f}s")
 
+        t1 = time.perf_counter()
         rows = _knn_search(query_vec, top_k)
+        print(f"  [timing] vector search: {time.perf_counter() - t1:.3f}s")
         if not rows:
             return [], "No results found."
 
         if reranker is not None:
+            t2 = time.perf_counter()
             query_str = text_query if text_query else "[image query]"
-            ranked = _rerank(query_str, rows, reranker)
+            ranked = _rerank(query_str, rows, reranker, rerank_k=rerank_k)
+            print(f"  [timing] reranking ({len(rows[:rerank_k])}/{len(rows)} candidates): {time.perf_counter() - t2:.3f}s")
         else:
             ranked = _distance_scores(rows)
 
-        gallery = [(item[1], f"#{i + 1}  score: {item[0]:.4f}") for i, item in enumerate(ranked)]
+        print(f"  [timing] total: {time.perf_counter() - t0:.3f}s")
+
+        gallery = [
+            (_ensure_browser_compatible(item[1]), f"#{i + 1}  score: {item[0]:.4f}")
+            for i, item in enumerate(ranked)
+        ]
         summary = f"Found {len(ranked)} results"
         return gallery, summary
 
@@ -324,7 +390,7 @@ def cmd_serve(port: int = 7860, no_rerank: bool = False):
         )
 
     print(f"\nLaunching at http://localhost:{port}")
-    app.launch(server_port=port, allowed_paths=list(dirs))
+    app.launch(server_port=port, allowed_paths=list(dirs) + [str(heic_cache)])
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────────
@@ -338,24 +404,28 @@ def main():
 
     emb = sub.add_parser("embed", help="Embed images from a path")
     emb.add_argument("path", help="Path to image file or directory")
+    emb.add_argument("--device", help="Compute device: cuda, mps, cpu (default: auto-detect)")
 
     srch = sub.add_parser("search", help="Semantic search for images")
     srch.add_argument("desc", help="Text description to search for")
     srch.add_argument("--top-k", type=int, default=20, help="Candidates from vector search (default: 20)")
     srch.add_argument("--no-rerank", action="store_true", help="Skip reranking, use vector similarity only")
+    srch.add_argument("--device", help="Compute device: cuda, mps, cpu (default: auto-detect)")
 
     srv = sub.add_parser("serve", help="Launch web UI for image search")
     srv.add_argument("--port", type=int, default=7860, help="Server port (default: 7860)")
     srv.add_argument("--no-rerank", action="store_true", help="Skip reranking, use vector similarity only")
+    srv.add_argument("--device", help="Compute device: cuda, mps, cpu (default: auto-detect)")
+    srv.add_argument("--rerank-k", type=int, default=10, help="Number of candidates to rerank (default: 10)")
 
     args = parser.parse_args()
 
     if args.command == "embed":
-        cmd_embed(args.path)
+        cmd_embed(args.path, device=getattr(args, "device", None))
     elif args.command == "search":
-        cmd_search(args.desc, top_k=args.top_k, no_rerank=args.no_rerank)
+        cmd_search(args.desc, top_k=args.top_k, no_rerank=args.no_rerank, device=getattr(args, "device", None))
     elif args.command == "serve":
-        cmd_serve(port=args.port, no_rerank=args.no_rerank)
+        cmd_serve(port=args.port, no_rerank=args.no_rerank, device=getattr(args, "device", None), rerank_k=args.rerank_k)
 
 
 if __name__ == "__main__":
