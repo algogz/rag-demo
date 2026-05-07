@@ -30,7 +30,7 @@ DB_PATH = Path(__file__).parent / "image_vectors.db"
 EMBED_DIM = 2048
 
 EMBEDDING_MODEL_ID = "Qwen/Qwen3-VL-Embedding-2B"
-RERANKER_MODEL_ID = "Qwen/Qwen3-VL-Reranker-8B"
+RERANKER_MODEL_ID = "Qwen/Qwen3-VL-Reranker-2B"
 
 IMAGE_EXTS = {
     ".jpg",
@@ -262,40 +262,69 @@ def _resize_for_rerank(img: "Image.Image", max_pixels: int) -> "Image.Image":
     return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
 
-_RERANK_STAGE1_PIXELS = 112896  # 336x336
-_RERANK_STAGE1_K = 50
-_RERANK_STAGE2_PIXELS = 589824  # 768x768
-_RERANK_STAGE2_K = 20
+_RERANK_S1_PIXELS = 112896  # 336x336 — coarse filter
+_RERANK_S1_K = 30
+_RERANK_S2_PIXELS = 450816  # 672x672 — fine scoring
+_RERANK_S2_K = 10
+
+
+def _score_pairs(
+    query, candidates, reranker, max_pixels: int, batch_size: int
+) -> list[float]:
+    """Score (query, image) pairs with the reranker. Returns normalized scores."""
+    from PIL import Image
+
+    pairs = [
+        (query, _resize_for_rerank(Image.open(row[2]), max_pixels))
+        for row in candidates
+    ]
+    raw = reranker.predict(pairs, batch_size=batch_size)
+    if hasattr(raw, "tolist"):
+        raw = raw.tolist()
+    flat = [float(s) for s in raw]
+    min_s, max_s = min(flat), max(flat)
+    if max_s > min_s:
+        return [(s - min_s) / (max_s - min_s) for s in flat]
+    return [1.0 for _ in flat]
 
 
 def _rerank(
-    query, rows: list[tuple], reranker, rerank_k: int = 10
+    query,
+    rows: list[tuple],
+    reranker=None,
+    *,
+    mode: str = "2-stage",
+    s1_k: int = 30,
+    s2_k: int = 10,
+    rerank_k: int = 10,
 ) -> list[tuple[float, str, str]]:
-    """Two-stage rerank: coarse (336px, top-50) then fine (768px, top-20)."""
+    """Unified rerank with mode: 'none', '1-stage', or '2-stage'."""
     import time
 
-    from PIL import Image
+    mode = mode.lower()
+    if mode == "none":
+        return _distance_scores(rows[:rerank_k])
 
-    def _score(candidates, max_pixels, batch_size):
-        pairs = [
-            (query, _resize_for_rerank(Image.open(row[2]), max_pixels))
-            for row in candidates
-        ]
-        raw = reranker.predict(pairs, batch_size=batch_size)
-        if hasattr(raw, "tolist"):
-            raw = raw.tolist()
-        flat = [float(s) for s in raw]
-        min_s, max_s = min(flat), max(flat)
-        if max_s > min_s:
-            return [(s - min_s) / (max_s - min_s) for s in flat]
-        return [1.0 for _ in flat]
+    if mode == "1-stage":
+        candidates = rows[:s1_k]
+        t0 = time.perf_counter()
+        scores = _score_pairs(query, candidates, reranker, _RERANK_S2_PIXELS, batch_size=10)
+        print(
+            f"    [timing] 1-stage ({len(candidates)} imgs @ 672px): {time.perf_counter() - t0:.3f}s"
+        )
+        ranked = sorted(
+            zip(scores, candidates, strict=True),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        return [(s, row[2], row[3]) for s, row in ranked[:rerank_k]]
 
-    # Stage 1: coarse rerank at low resolution
-    s1_candidates = rows[:_RERANK_STAGE1_K]
+    # 2-stage
+    s1_candidates = rows[:s1_k]
     t1 = time.perf_counter()
-    s1_scores = _score(s1_candidates, _RERANK_STAGE1_PIXELS, batch_size=20)
+    s1_scores = _score_pairs(query, s1_candidates, reranker, _RERANK_S1_PIXELS, batch_size=20)
     print(
-        f"    [timing] stage1 rerank ({len(s1_candidates)} imgs, {_RERANK_STAGE1_PIXELS}px): {time.perf_counter() - t1:.3f}s"
+        f"    [timing] stage1 ({len(s1_candidates)} imgs @ 336px): {time.perf_counter() - t1:.3f}s"
     )
     s1_ranked = sorted(
         zip(s1_scores, s1_candidates, strict=True),
@@ -303,12 +332,11 @@ def _rerank(
         reverse=True,
     )
 
-    # Stage 2: fine rerank at higher resolution
-    s2_candidates = [row for _, row in s1_ranked[:_RERANK_STAGE2_K]]
+    s2_candidates = [row for _, row in s1_ranked[:s2_k]]
     t2 = time.perf_counter()
-    s2_scores = _score(s2_candidates, _RERANK_STAGE2_PIXELS, batch_size=10)
+    s2_scores = _score_pairs(query, s2_candidates, reranker, _RERANK_S2_PIXELS, batch_size=10)
     print(
-        f"    [timing] stage2 rerank ({len(s2_candidates)} imgs, {_RERANK_STAGE2_PIXELS}px): {time.perf_counter() - t2:.3f}s"
+        f"    [timing] stage2 ({len(s2_candidates)} imgs @ 672px): {time.perf_counter() - t2:.3f}s"
     )
     s2_ranked = sorted(
         zip(s2_scores, s2_candidates, strict=True),
@@ -358,14 +386,14 @@ def cmd_search(
     query_emb = embed_model.encode(
         [query], normalize_embeddings=True, show_progress_bar=False
     )
-    rows = _knn_search(query_emb[0], max(top_k, _RERANK_STAGE1_K))
+    rows = _knn_search(query_emb[0], max(top_k, _RERANK_S1_K))
 
     if not rows:
         print("No results found")
         return
 
     if no_rerank:
-        ranked = _distance_scores(rows)
+        ranked = _rerank(query, rows, mode="none", rerank_k=top_k)
     else:
         mp = model_path(RERANKER_MODEL_ID)
         print(f"Loading reranker model from: {mp} ...")
@@ -391,7 +419,6 @@ def cmd_serve(
     port: int = 7860,
     no_rerank: bool = False,
     device: str | None = None,
-    rerank_k: int = 10,
 ):
     import gradio as gr
     from PIL import Image
@@ -447,7 +474,14 @@ def cmd_serve(
             Image.open(path).convert("RGB").save(jpeg_path, "JPEG", quality=90)
         return str(jpeg_path)
 
-    def do_search(text_query: str, image_file, top_k: int):
+    def do_search(
+        text_query: str,
+        image_file,
+        rerank_mode: str,
+        s1_k: int,
+        s2_k: int,
+        rerank_k: int,
+    ):
         if not text_query and image_file is None:
             return [], "Please enter a text query or upload an image."
 
@@ -466,56 +500,116 @@ def cmd_serve(
         print(f"  [timing] embedding: {time.perf_counter() - t0:.3f}s")
 
         t1 = time.perf_counter()
-        rows = _knn_search(query_vec, max(top_k, _RERANK_STAGE1_K))
-        print(f"  [timing] vector search: {time.perf_counter() - t1:.3f}s")
+        knn_k = max(s1_k, rerank_k)
+        rows = _knn_search(query_vec, knn_k)
+        print(f"  [timing] vector search (k={knn_k}): {time.perf_counter() - t1:.3f}s")
         if not rows:
             return [], "No results found."
 
-        if reranker is not None:
-            t2 = time.perf_counter()
-            query_str = text_query if text_query else "[image query]"
-            ranked = _rerank(query_str, rows, reranker, rerank_k=rerank_k)
-            print(
-                f"  [timing] reranking ({len(rows[:rerank_k])}/{len(rows)} candidates): {time.perf_counter() - t2:.3f}s"
-            )
-        else:
-            ranked = _distance_scores(rows)
+        query_str = text_query if text_query else "[image query]"
 
-        print(f"  [timing] total: {time.perf_counter() - t0:.3f}s")
+        # Enforce: candidates >= stage2 >= results
+        rerank_k = max(1, min(rerank_k, s2_k, s1_k))
+        s2_k = max(rerank_k, min(s2_k, s1_k))
+
+        # Disable reranker when not loaded
+        effective_mode = rerank_mode if reranker is not None else "none"
+
+        ranked = _rerank(
+            query_str,
+            rows,
+            reranker,
+            mode=effective_mode,
+            s1_k=s1_k,
+            s2_k=s2_k,
+            rerank_k=rerank_k,
+        )
+
+        elapsed = time.perf_counter() - t0
+        print(f"  [timing] total: {elapsed:.3f}s")
 
         gallery = [
             (_ensure_browser_compatible(item[1]), f"#{i + 1}  score: {item[0]:.4f}")
             for i, item in enumerate(ranked)
         ]
-        summary = f"Found {len(ranked)} results"
+        summary = f"Found {len(ranked)} results in {elapsed:.1f}s"
         return gallery, summary
 
     with gr.Blocks(title="Image Search") as app:
-        gr.Markdown("# Image Semantic Search")
-        gr.Markdown("Search by text description or upload a reference image.")
+        gr.Markdown("### Image Semantic Search")
 
         with gr.Row():
             text_input = gr.Textbox(
-                label="Text Query", placeholder="Describe what you're looking for..."
+                label="Query",
+                placeholder="Describe what you're looking for...",
+                scale=4,
             )
-            image_input = gr.Image(label="Image Query (optional)", type="filepath")
+            image_input = gr.Image(
+                label="Image", type="filepath", height=80, scale=1, show_label=True
+            )
+            search_btn = gr.Button("Search", variant="primary", scale=0, min_width=80)
 
-        top_k = gr.Slider(5, 50, value=20, step=5, label="Top K")
+        with gr.Row():
+            rerank_mode = gr.Radio(
+                choices=["2-stage", "1-stage", "None"],
+                value="2-stage",
+                label="Rerank",
+                show_label=True,
+                scale=1,
+            )
+            s1_k_input = gr.Number(
+                value=_RERANK_S1_K, label="Candidates", minimum=5, maximum=100, step=5, scale=0, min_width=90
+            )
+            s2_k_input = gr.Number(
+                value=_RERANK_S2_K, label="Stage 2", minimum=5, maximum=50, step=5, scale=0, min_width=90
+            )
+            rerank_k_input = gr.Number(
+                value=10, label="Results", minimum=1, maximum=50, step=1, scale=0, min_width=90
+            )
+            status = gr.Markdown("")
 
-        search_btn = gr.Button("Search", variant="primary")
-        status = gr.Markdown()
+        # Show/hide Stage 2 control based on mode
+        rerank_mode.change(
+            fn=lambda m: gr.update(visible=(m == "2-stage")),
+            inputs=[rerank_mode],
+            outputs=[s2_k_input],
+        )
+
+        # Enforce s1_k >= s2_k >= rerank_k on input change
+        def _clamp_s1(s1, s2, rerank_k):
+            s1 = max(s1, 1)
+            s2 = min(s2, s1)
+            rerank_k = min(rerank_k, s2)
+            return gr.update(value=s1), gr.update(value=s2), gr.update(value=rerank_k)
+
+        def _clamp_s2(s1, s2, rerank_k):
+            s2 = max(s2, 1)
+            s1 = max(s1, s2)
+            rerank_k = min(rerank_k, s2)
+            return gr.update(value=s1), gr.update(value=s2), gr.update(value=rerank_k)
+
+        def _clamp_rerank_k(s1, s2, rerank_k):
+            rerank_k = max(rerank_k, 1)
+            s2 = max(s2, rerank_k)
+            s1 = max(s1, s2)
+            return gr.update(value=s1), gr.update(value=s2), gr.update(value=rerank_k)
+
+        all_three = [s1_k_input, s2_k_input, rerank_k_input]
+        s1_k_input.change(fn=_clamp_s1, inputs=all_three, outputs=all_three)
+        s2_k_input.change(fn=_clamp_s2, inputs=all_three, outputs=all_three)
+        rerank_k_input.change(fn=_clamp_rerank_k, inputs=all_three, outputs=all_three)
 
         gallery = gr.Gallery(
-            label="Results",
-            columns=4,
-            height="auto",
+            label="Results (click image to zoom)",
+            columns=5,
+            height=800,
             object_fit="contain",
             show_label=True,
         )
 
         search_btn.click(
             fn=do_search,
-            inputs=[text_input, image_input, top_k],
+            inputs=[text_input, image_input, rerank_mode, s1_k_input, s2_k_input, rerank_k_input],
             outputs=[gallery, status],
         )
 
@@ -567,12 +661,6 @@ def main():
     srv.add_argument(
         "--device", help="Compute device: cuda, mps, cpu (default: auto-detect)"
     )
-    srv.add_argument(
-        "--rerank-k",
-        type=int,
-        default=10,
-        help="Number of candidates to rerank (default: 10)",
-    )
 
     args = parser.parse_args()
 
@@ -590,7 +678,6 @@ def main():
             port=args.port,
             no_rerank=args.no_rerank,
             device=getattr(args, "device", None),
-            rerank_k=args.rerank_k,
         )
 
 
