@@ -171,30 +171,60 @@ def cmd_embed(path: str, device: str | None = None):
         return img.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
 
     batch_size = 32
+    t0 = time.perf_counter()
+    failed: list[tuple[str, str]] = []
+
+    def _fmt_dur(seconds: float) -> str:
+        s = int(seconds)
+        return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
     for i in range(0, len(new_images), batch_size):
         batch = new_images[i : i + batch_size]
         paths = [str(img) for img in batch]
         n_batch = i // batch_size + 1
         n_total = (len(new_images) - 1) // batch_size + 1
-        print(f"  Batch {n_batch}/{n_total} ({len(batch)} images) ...")
+        t_batch = time.perf_counter()
 
-        pil_images = [_resize_for_embed(Image.open(p)) for p in paths]
+        # Load images, skip unreadable files
+        loaded: list[tuple[str, Image.Image]] = []
+        for p in paths:
+            try:
+                loaded.append((p, _resize_for_embed(Image.open(p))))
+            except Exception as e:
+                failed.append((p, str(e)))
+                print(f"    SKIP {p}: {e}")
+
+        if not loaded:
+            continue
+
+        load_paths, pil_images = zip(*loaded)
         try:
             embeddings = model.encode(
-                pil_images, normalize_embeddings=True, show_progress_bar=False
+                list(pil_images), normalize_embeddings=True, show_progress_bar=False
             )
-            ok_pairs = list(zip(paths, embeddings))
+            ok_pairs = list(zip(load_paths, embeddings))
         except Exception as exc:
             print(f"    Batch encode failed ({exc}), retrying one-by-one ...")
             ok_pairs = []
-            for p, img in zip(paths, pil_images):
+            for p, img in zip(load_paths, pil_images):
                 try:
                     emb = model.encode(
                         [img], normalize_embeddings=True, show_progress_bar=False
                     )[0]
                     ok_pairs.append((p, emb))
                 except Exception as e:
+                    failed.append((p, str(e)))
                     print(f"    SKIP {p}: {e}")
+
+        batch_time = time.perf_counter() - t_batch
+        elapsed = time.perf_counter() - t0
+        avg = elapsed / n_batch
+        eta = avg * (n_total - n_batch)
+
+        print(
+            f"  [{time.strftime('%H:%M:%S')}] Batch {n_batch}/{n_total} ({len(batch)} images) "
+            f"| {batch_time:.1f}s | {_fmt_dur(elapsed)} elapsed, ~{_fmt_dur(eta)} remaining"
+        )
 
         for path_str, emb in ok_pairs:
             cur = db.execute(
@@ -209,6 +239,10 @@ def cmd_embed(path: str, device: str | None = None):
 
     total = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
     print(f"Done. Total images in DB: {total}")
+    if failed:
+        print(f"\n{len(failed)} file(s) failed:")
+        for p, reason in failed:
+            print(f"  {p}: {reason}")
     db.close()
 
 
@@ -261,6 +295,104 @@ def _resize_for_rerank(img: "Image.Image", max_pixels: int) -> "Image.Image":
     scale = math.sqrt(max_pixels / (w * h))
     return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
+
+# ─── Gallery Modal Enhancement (CSS + JS) ──────────────────────────────────────
+
+_GALLERY_CSS = """
+.ge-1x1-btn {
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.5px;
+    cursor: pointer;
+}
+.ge-open-btn {
+    font-size: 15px !important;
+    text-decoration: none !important;
+    line-height: 1;
+    cursor: pointer;
+}
+"""
+
+_GALLERY_JS = """
+(function() {
+  function enhance(img) {
+    if (!img.isConnected) return;
+    var preview = img.closest('.preview');
+    if (!preview || preview.querySelector('.ge-marker')) return;
+    var mediaBtn = preview.querySelector('.media-button');
+    var toolbar = preview.querySelector('.icon-button-wrapper');
+    if (!mediaBtn || !toolbar) return;
+
+    var marker = document.createElement('span');
+    marker.className = 'ge-marker';
+    marker.style.display = 'none';
+    preview.appendChild(marker);
+
+    var btn1x1 = document.createElement('button');
+    btn1x1.className = 'icon-button ge-1x1-btn';
+    btn1x1.textContent = '1:1';
+    btn1x1.title = 'Show original size';
+    btn1x1.addEventListener('click', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (img.dataset.geZoom === '1x1') {
+        img.style.flex = '';
+        img.style.objectFit = '';
+        img.style.width = '';
+        img.style.height = '';
+        mediaBtn.style.overflow = '';
+        img.dataset.geZoom = '';
+        btn1x1.textContent = '1:1';
+        btn1x1.title = 'Show original size';
+      } else {
+        mediaBtn.style.overflow = 'auto';
+        img.style.flex = 'none';
+        img.style.objectFit = 'none';
+        img.style.width = img.naturalWidth + 'px';
+        img.style.height = img.naturalHeight + 'px';
+        img.dataset.geZoom = '1x1';
+        btn1x1.textContent = 'Fit';
+        btn1x1.title = 'Fit to view';
+      }
+    });
+
+    var openLink = document.createElement('a');
+    openLink.className = 'icon-button ge-open-btn';
+    openLink.textContent = '\\u2197';
+    openLink.title = 'Open in new window';
+    openLink.target = '_blank';
+    openLink.rel = 'noopener noreferrer';
+    openLink.href = img.src;
+    openLink.addEventListener('click', function(e) { e.stopPropagation(); });
+
+    toolbar.insertBefore(openLink, toolbar.firstChild);
+    toolbar.insertBefore(btn1x1, toolbar.firstChild);
+
+    var imgObs = new MutationObserver(function() {
+      openLink.href = img.src;
+      if (img.dataset.geZoom === '1x1') {
+        img.style.flex = '';
+        img.style.objectFit = '';
+        img.style.width = '';
+        img.style.height = '';
+        mediaBtn.style.overflow = '';
+        img.dataset.geZoom = '';
+        btn1x1.textContent = '1:1';
+      }
+    });
+    imgObs.observe(img, { attributes: true, attributeFilter: ['src'] });
+  }
+
+  var observer = new MutationObserver(function() {
+    var img = document.querySelector('[data-testid="detailed-image"]');
+    if (img && !img.dataset.geEnhanced) {
+      img.dataset.geEnhanced = 'true';
+      setTimeout(function() { enhance(img); }, 50);
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+})();
+"""
 
 _RERANK_S1_PIXELS = 112896  # 336x336 — coarse filter
 _RERANK_S1_K = 30
@@ -535,7 +667,7 @@ def cmd_serve(
         summary = f"Found {len(ranked)} results in {elapsed:.1f}s"
         return gallery, summary
 
-    with gr.Blocks(title="Image Search") as app:
+    with gr.Blocks(title="Image Search", css=_GALLERY_CSS, js=_GALLERY_JS) as app:
         gr.Markdown("### Image Semantic Search")
 
         with gr.Row():
