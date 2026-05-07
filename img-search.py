@@ -15,10 +15,13 @@ import struct
 import sys
 import tempfile
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
 from pillow_heif import register_heif_opener
+
+warnings.filterwarnings("ignore", message="Palette images with Transparency")
 
 register_heif_opener()
 
@@ -27,7 +30,7 @@ DB_PATH = Path(__file__).parent / "image_vectors.db"
 EMBED_DIM = 2048
 
 EMBEDDING_MODEL_ID = "Qwen/Qwen3-VL-Embedding-2B"
-RERANKER_MODEL_ID = "Qwen/Qwen3-VL-Reranker-2B"
+RERANKER_MODEL_ID = "Qwen/Qwen3-VL-Reranker-8B"
 
 IMAGE_EXTS = {
     ".jpg",
@@ -46,6 +49,14 @@ def model_path(model_id: str) -> str:
     local = MODEL_DIR / model_id.replace("/", "--")
     if local.exists():
         return str(local)
+    # Check huggingface_hub cache layout: models/<org>--<repo>/snapshots/<hash>/
+    cache_dir = MODEL_DIR / f"models--{model_id.replace('/', '--')}"
+    if cache_dir.exists():
+        import glob
+
+        snaps = glob.glob(str(cache_dir / "snapshots" / "*"))
+        if snaps:
+            return snaps[0]
     os.makedirs(MODEL_DIR, exist_ok=True)
     return model_id
 
@@ -151,14 +162,13 @@ def cmd_embed(path: str, device: str | None = None):
     _EMBED_MAX_LONG_EDGE = 768
 
     def _resize_for_embed(img: Image.Image) -> Image.Image:
+        img = _safe_to_rgb(img)
         w, h = img.size
         long = max(w, h)
         if long <= _EMBED_MAX_LONG_EDGE:
-            return img.convert("RGB")
+            return img
         scale = _EMBED_MAX_LONG_EDGE / long
-        return img.resize((round(w * scale), round(h * scale)), Image.LANCZOS).convert(
-            "RGB"
-        )
+        return img.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
 
     batch_size = 32
     for i in range(0, len(new_images), batch_size):
@@ -227,45 +237,85 @@ def _knn_search(query_vec: np.ndarray, top_k: int) -> list[tuple]:
     return rows
 
 
-_RERANK_MAX_PIXELS = 147456  # ~384x384, enough for relevance scoring
+def _safe_to_rgb(img: "Image.Image") -> "Image.Image":
+    """Convert any PIL image to RGB, handling palette/GIF with transparency safely."""
+    if img.mode in ("RGBA", "LA", "PA"):
+        return img.convert("RGB")
+    if img.mode == "P":
+        return img.convert("RGBA").convert("RGB")
+    if img.mode != "RGB":
+        return img.convert("RGB")
+    return img
 
 
-def _resize_for_rerank(img) -> "Image.Image":
-    """Resize image so total pixels <= _RERANK_MAX_PIXELS, keeping aspect ratio."""
-    w, h = img.size
-    if w * h <= _RERANK_MAX_PIXELS:
-        return img
+def _resize_for_rerank(img: "Image.Image", max_pixels: int) -> "Image.Image":
+    """Resize image so total pixels <= max_pixels, keeping aspect ratio."""
     import math
 
-    scale = math.sqrt(_RERANK_MAX_PIXELS / (w * h))
-    return img.resize((int(w * scale), int(h * scale)))
+    from PIL import Image
+
+    img = _safe_to_rgb(img)
+    w, h = img.size
+    if w * h <= max_pixels:
+        return img
+    scale = math.sqrt(max_pixels / (w * h))
+    return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+
+_RERANK_STAGE1_PIXELS = 112896  # 336x336
+_RERANK_STAGE1_K = 50
+_RERANK_STAGE2_PIXELS = 589824  # 768x768
+_RERANK_STAGE2_K = 20
 
 
 def _rerank(
     query, rows: list[tuple], reranker, rerank_k: int = 10
 ) -> list[tuple[float, str, str]]:
-    """Rerank top-N results. Returns list of (score, path, filename)."""
+    """Two-stage rerank: coarse (336px, top-50) then fine (768px, top-20)."""
+    import time
+
     from PIL import Image
 
-    candidates = rows[:rerank_k]
-    pairs = [(query, _resize_for_rerank(Image.open(row[2]))) for row in candidates]
-    raw_scores = reranker.predict(pairs, batch_size=10)
+    def _score(candidates, max_pixels, batch_size):
+        pairs = [
+            (query, _resize_for_rerank(Image.open(row[2]), max_pixels))
+            for row in candidates
+        ]
+        raw = reranker.predict(pairs, batch_size=batch_size)
+        if hasattr(raw, "tolist"):
+            raw = raw.tolist()
+        flat = [float(s) for s in raw]
+        min_s, max_s = min(flat), max(flat)
+        if max_s > min_s:
+            return [(s - min_s) / (max_s - min_s) for s in flat]
+        return [1.0 for _ in flat]
 
-    if hasattr(raw_scores, "tolist"):
-        raw_scores = raw_scores.tolist()
-    flat = [float(s) for s in raw_scores]
-    min_s, max_s = min(flat), max(flat)
-    if max_s > min_s:
-        scores = [(s - min_s) / (max_s - min_s) for s in flat]
-    else:
-        scores = [1.0 for _ in flat]
-
-    ranked = sorted(
-        zip(scores, candidates, strict=True),
+    # Stage 1: coarse rerank at low resolution
+    s1_candidates = rows[:_RERANK_STAGE1_K]
+    t1 = time.perf_counter()
+    s1_scores = _score(s1_candidates, _RERANK_STAGE1_PIXELS, batch_size=20)
+    print(
+        f"    [timing] stage1 rerank ({len(s1_candidates)} imgs, {_RERANK_STAGE1_PIXELS}px): {time.perf_counter() - t1:.3f}s"
+    )
+    s1_ranked = sorted(
+        zip(s1_scores, s1_candidates, strict=True),
         key=lambda x: x[0],
         reverse=True,
     )
-    return [(s, row[2], row[3]) for s, row in ranked]
+
+    # Stage 2: fine rerank at higher resolution
+    s2_candidates = [row for _, row in s1_ranked[:_RERANK_STAGE2_K]]
+    t2 = time.perf_counter()
+    s2_scores = _score(s2_candidates, _RERANK_STAGE2_PIXELS, batch_size=10)
+    print(
+        f"    [timing] stage2 rerank ({len(s2_candidates)} imgs, {_RERANK_STAGE2_PIXELS}px): {time.perf_counter() - t2:.3f}s"
+    )
+    s2_ranked = sorted(
+        zip(s2_scores, s2_candidates, strict=True),
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    return [(s, row[2], row[3]) for s, row in s2_ranked[:rerank_k]]
 
 
 def _distance_scores(rows: list[tuple]) -> list[tuple[float, str, str]]:
@@ -308,7 +358,7 @@ def cmd_search(
     query_emb = embed_model.encode(
         [query], normalize_embeddings=True, show_progress_bar=False
     )
-    rows = _knn_search(query_emb[0], top_k)
+    rows = _knn_search(query_emb[0], max(top_k, _RERANK_STAGE1_K))
 
     if not rows:
         print("No results found")
@@ -405,7 +455,7 @@ def cmd_serve(
 
         # Build query vector
         if image_file is not None:
-            query_input = Image.open(image_file)
+            query_input = _safe_to_rgb(Image.open(image_file))
         else:
             query_input = text_query
 
@@ -416,7 +466,7 @@ def cmd_serve(
         print(f"  [timing] embedding: {time.perf_counter() - t0:.3f}s")
 
         t1 = time.perf_counter()
-        rows = _knn_search(query_vec, top_k)
+        rows = _knn_search(query_vec, max(top_k, _RERANK_STAGE1_K))
         print(f"  [timing] vector search: {time.perf_counter() - t1:.3f}s")
         if not rows:
             return [], "No results found."
