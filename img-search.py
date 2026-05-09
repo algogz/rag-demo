@@ -506,7 +506,13 @@ def _distance_scores(rows: list[tuple]) -> list[tuple[float, str, str]]:
 
 
 def cmd_search(
-    query: str, top_k: int = 20, no_rerank: bool = False, device: str | None = None
+    query: str,
+    top_k: int = 20,
+    no_rerank: bool = False,
+    device: str | None = None,
+    person: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ):
     from sentence_transformers import CrossEncoder, SentenceTransformer
 
@@ -529,6 +535,15 @@ def cmd_search(
         model_kwargs={"torch_dtype": _model_dtype(dev)},
     )
 
+    # Build metadata filters
+    filter_rowids = _parse_metadata_filters(
+        person_filter=person or "",
+        date_from=date_from or "",
+        date_to=date_to or "",
+    )
+    if filter_rowids is not None:
+        print(f"Metadata filter: {len(filter_rowids)} candidates")
+
     print(f"\nQuery: {query}")
     print(f"Database: {total} images")
     print("─" * 70)
@@ -536,7 +551,9 @@ def cmd_search(
     query_emb = embed_model.encode(
         [query], normalize_embeddings=True, show_progress_bar=False
     )
-    rows = _knn_search(query_emb[0], max(top_k, _RERANK_S1_K))
+    rows = _knn_search_filtered(
+        query_emb[0], max(top_k, _RERANK_S1_K), filter_rowids
+    )
 
     if not rows:
         print("No results found")
@@ -562,7 +579,729 @@ def cmd_search(
     print("─" * 70)
 
 
+# ─── Apple Photos Metadata Indexer ─────────────────────────────────────────────
+
+APPLE_PHOTOS_DB = "database/Photos.sqlite"
+CORE_DATA_EPOCH = 978307200  # seconds between 1970-01-01 and 2001-01-01
+
+
+def _open_apple_photos_db(library_path: str) -> sqlite3.Connection:
+    """Open Apple Photos SQLite DB. Handles SMB mounts via immutable=1."""
+    db_path = Path(library_path) / APPLE_PHOTOS_DB
+    if not db_path.exists():
+        print(f"Error: {db_path} not found")
+        sys.exit(1)
+    return sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
+
+
+def _create_metadata_tables(db: sqlite3.Connection):
+    """Create metadata tables if they don't exist."""
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS photo_metadata (
+            rowid INTEGER PRIMARY KEY,
+            asset_pk INTEGER,
+            date_created REAL,
+            latitude REAL,
+            longitude REAL,
+            timezone_name TEXT,
+            moment_title TEXT,
+            camera_model TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS photo_persons (
+            rowid INTEGER NOT NULL,
+            person_name TEXT NOT NULL,
+            PRIMARY KEY (rowid, person_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS photo_scenes (
+            rowid INTEGER NOT NULL,
+            scene_id INTEGER NOT NULL,
+            confidence REAL NOT NULL,
+            PRIMARY KEY (rowid, scene_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_meta_date ON photo_metadata(date_created);
+        CREATE INDEX IF NOT EXISTS idx_meta_latlon ON photo_metadata(latitude, longitude);
+        CREATE INDEX IF NOT EXISTS idx_persons_name ON photo_persons(person_name);
+        CREATE INDEX IF NOT EXISTS idx_scenes_rowid ON photo_scenes(rowid);
+    """)
+    db.commit()
+
+
+def cmd_index_photos(library_path: str):
+    """Index Apple Photos metadata into image_vectors.db."""
+    apple_db = _open_apple_photos_db(library_path)
+    vec_db = init_db()
+    _create_metadata_tables(vec_db)
+
+    # Build path→rowid map from our image vectors DB
+    # Extract "originals/X/filename.ext" suffix for matching
+    rows = vec_db.execute("SELECT rowid, path FROM images").fetchall()
+    path_to_rowid: dict[str, int] = {}
+    for rowid, path in rows:
+        # Extract the originals/... suffix
+        parts = path.replace("\\", "/").split("/")
+        for i, p in enumerate(parts):
+            if p == "originals" and i + 2 < len(parts):
+                suffix = f"originals/{parts[i+1]}/{parts[i+2]}"
+                path_to_rowid[suffix] = rowid
+                break
+
+    print(f"Loaded {len(path_to_rowid)} image paths from vector DB")
+
+    # Build asset_pk→rowid mapping via ZDIRECTORY/ZFILENAME
+    print("Matching Apple Photos assets to vector DB...")
+    asset_rows = apple_db.execute("""
+        SELECT a.Z_PK, a.ZDIRECTORY, a.ZFILENAME,
+               a.ZDATECREATED, a.ZLATITUDE, a.ZLONGITUDE,
+               a.ZMOMENT, a.ZEXTENDEDATTRIBUTES, a.ZADDITIONALATTRIBUTES
+        FROM ZASSET a
+    """).fetchall()
+
+    matched = 0
+    asset_to_rowid: dict[int, int] = {}
+
+    for pk, directory, filename, date_created, lat, lon, moment_fk, ext_fk, add_fk in asset_rows:
+        suffix = f"originals/{directory}/{filename}"
+        rowid = path_to_rowid.get(suffix)
+        if rowid is not None:
+            asset_to_rowid[pk] = rowid
+            matched += 1
+
+    print(f"Matched {matched} assets ({len(asset_rows)} total in Photos DB)")
+
+    if not matched:
+        print("No matches found — check library path")
+        apple_db.close()
+        vec_db.close()
+        return
+
+    # Phase 1: Photo metadata (date, GPS, camera)
+    print("Indexing photo metadata (date, GPS, camera)...")
+    moment_cache: dict[int, tuple] = {}
+    moment_rows = apple_db.execute("SELECT Z_PK, ZTITLE FROM ZMOMENT").fetchall()
+    for pk, title in moment_rows:
+        moment_cache[pk] = (title,)
+
+    ext_cache: dict[int, str] = {}
+    ext_rows = apple_db.execute("SELECT Z_PK, ZCAMERAMODEL FROM ZEXTENDEDATTRIBUTES").fetchall()
+    for pk, model in ext_rows:
+        ext_cache[pk] = model or ""
+
+    add_cache: dict[int, tuple] = {}
+    add_rows = apple_db.execute("SELECT Z_PK, ZTIMEZONENAME FROM ZADDITIONALASSETATTRIBUTES").fetchall()
+    for pk, tz in add_rows:
+        add_cache[pk] = (tz,)
+
+    vec_db.execute("DELETE FROM photo_metadata")
+    batch = []
+    for pk, rowid in asset_to_rowid.items():
+        # Find the original asset row data
+        # We need to look up by pk — iterate asset_rows again (use dict)
+        pass
+
+    # Rebuild with dict for O(1) lookup
+    asset_data: dict[int, tuple] = {}
+    for pk, directory, filename, date_created, lat, lon, moment_fk, ext_fk, add_fk in asset_rows:
+        if pk in asset_to_rowid:
+            rowid = asset_to_rowid[pk]
+            moment_title = moment_cache.get(moment_fk, (None,))[0] if moment_fk else None
+            camera_model = ext_cache.get(ext_fk, "")
+            tz_name = add_cache.get(add_fk, (None,))[0] if add_fk else None
+            # Skip placeholder coordinates (-180, -180)
+            if lat == -180.0 or lon == -180.0:
+                lat, lon = None, None
+            batch.append((rowid, pk, date_created, lat, lon, tz_name, moment_title, camera_model))
+
+    vec_db.executemany(
+        "INSERT OR REPLACE INTO photo_metadata (rowid, asset_pk, date_created, latitude, longitude, timezone_name, moment_title, camera_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        batch,
+    )
+    vec_db.commit()
+    print(f"  Indexed {len(batch)} photo metadata records")
+
+    # Phase 2: Persons
+    print("Indexing persons...")
+    face_rows = apple_db.execute("""
+        SELECT f.ZASSETFORFACE, COALESCE(p.ZDISPLAYNAME, p.ZFULLNAME)
+        FROM ZDETECTEDFACE f
+        JOIN ZPERSON p ON f.ZPERSONFORFACE = p.Z_PK
+        WHERE COALESCE(p.ZDISPLAYNAME, p.ZFULLNAME) IS NOT NULL
+          AND COALESCE(p.ZDISPLAYNAME, p.ZFULLNAME) != ''
+    """).fetchall()
+
+    person_batch = []
+    for asset_pk, name in face_rows:
+        rowid = asset_to_rowid.get(asset_pk)
+        if rowid is not None:
+            person_batch.append((rowid, name))
+
+    vec_db.execute("DELETE FROM photo_persons")
+    vec_db.executemany(
+        "INSERT OR IGNORE INTO photo_persons (rowid, person_name) VALUES (?, ?)",
+        person_batch,
+    )
+    vec_db.commit()
+    print(f"  Indexed {len(person_batch)} person-face links")
+
+    # Person name stats
+    name_stats = vec_db.execute("""
+        SELECT person_name, COUNT(DISTINCT rowid) as cnt
+        FROM photo_persons GROUP BY person_name ORDER BY cnt DESC LIMIT 20
+    """).fetchall()
+    for name, cnt in name_stats:
+        print(f"    {name}: {cnt} photos")
+
+    # Phase 3: Scene classifications
+    print("Indexing scene classifications (this may take a minute)...")
+    vec_db.execute("DELETE FROM photo_scenes")
+
+    scene_rows = apple_db.execute("""
+        SELECT sc.ZASSETATTRIBUTES, sc.ZSCENEIDENTIFIER, sc.ZCONFIDENCE
+        FROM ZSCENECLASSIFICATION sc
+        WHERE sc.ZCONFIDENCE >= 0.3
+    """).fetchall()
+
+    # Need to map add_attr_pk → asset_pk → rowid
+    add_to_asset: dict[int, int] = {}
+    add_asset_rows = apple_db.execute("SELECT Z_PK, ZASSET FROM ZADDITIONALASSETATTRIBUTES").fetchall()
+    for add_pk, asset_pk in add_asset_rows:
+        add_to_asset[add_pk] = asset_pk
+
+    scene_batch = []
+    for add_pk, scene_id, confidence in scene_rows:
+        asset_pk = add_to_asset.get(add_pk)
+        if asset_pk is not None:
+            rowid = asset_to_rowid.get(asset_pk)
+            if rowid is not None:
+                scene_batch.append((rowid, scene_id, confidence))
+
+    vec_db.executemany(
+        "INSERT OR IGNORE INTO photo_scenes (rowid, scene_id, confidence) VALUES (?, ?, ?)",
+        scene_batch,
+    )
+    vec_db.commit()
+    print(f"  Indexed {len(scene_batch)} scene classifications")
+
+    # Summary
+    meta_count = vec_db.execute("SELECT COUNT(*) FROM photo_metadata").fetchone()[0]
+    person_photo_count = vec_db.execute("SELECT COUNT(DISTINCT rowid) FROM photo_persons").fetchone()[0]
+    scene_photo_count = vec_db.execute("SELECT COUNT(DISTINCT rowid) FROM photo_scenes").fetchone()[0]
+    print(f"\nDone! Metadata indexed for {meta_count} photos")
+    print(f"  {person_photo_count} photos with named persons")
+    print(f"  {scene_photo_count} photos with scene classifications")
+
+    apple_db.close()
+    vec_db.close()
+
+
+# ─── Metadata-Aware Search ─────────────────────────────────────────────────────
+
+# Scene ID to label mapping (common Apple Photos scene identifiers)
+# See: https://developer.apple.com/documentation/photokit/phphotossceneclassification
+
+
+def _metadata_filter(
+    db: sqlite3.Connection,
+    persons: list[str] | None = None,
+    date_from: float | None = None,
+    date_to: float | None = None,
+    lat_min: float | None = None,
+    lat_max: float | None = None,
+    lon_min: float | None = None,
+    lon_max: float | None = None,
+) -> set[int] | None:
+    """Return set of rowids matching metadata filters, or None if no filters."""
+    has_filter = any(v is not None for v in [persons, date_from, date_to, lat_min])
+    if not has_filter:
+        return None
+
+    conditions = ["1=1"]
+    params: list = []
+
+    if persons:
+        placeholders = ",".join("?" * len(persons))
+        conditions.append(
+            f"rowid IN (SELECT rowid FROM photo_persons WHERE person_name IN ({placeholders}))"
+        )
+        params.extend(persons)
+
+    if date_from is not None:
+        conditions.append("date_created >= ?")
+        params.append(date_from)
+
+    if date_to is not None:
+        conditions.append("date_created <= ?")
+        params.append(date_to)
+
+    if lat_min is not None:
+        conditions.append("latitude >= ? AND latitude <= ?")
+        params.extend([lat_min, lat_max])
+
+    if lon_min is not None:
+        conditions.append("longitude >= ? AND longitude <= ?")
+        params.extend([lon_min, lon_max])
+
+    where = " AND ".join(conditions)
+    rows = db.execute(
+        f"SELECT rowid FROM photo_metadata WHERE {where}", params
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def _knn_search_filtered(
+    query_vec: np.ndarray,
+    top_k: int,
+    allowed_rowids: set[int] | None = None,
+) -> list[tuple]:
+    """Vector KNN search with optional metadata pre-filter.
+    Returns list of (rowid, distance, path, filename).
+
+    Strategy: for small filter sets (< 500), compute distances for all
+    filtered images directly. For larger sets, use KNN-then-filter.
+    """
+    import sqlite_vec
+
+    db = sqlite3.connect(str(DB_PATH))
+    db.enable_load_extension(True)
+    sqlite_vec.load(db)
+    db.enable_load_extension(False)
+
+    total = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+    if total == 0:
+        db.close()
+        return []
+
+    if allowed_rowids is not None:
+        if not allowed_rowids:
+            db.close()
+            return []
+        filter_size = len(allowed_rowids)
+
+        if filter_size <= 500:
+            # Small filter: score ALL filtered images directly
+            placeholders = ",".join("?" * filter_size)
+            rows = db.execute(
+                f"""
+                SELECT vec.rowid, vec.distance, img.path, img.filename
+                FROM vec_embeddings vec
+                JOIN images img ON vec.rowid = img.rowid
+                WHERE vec.embedding MATCH ? AND k = ?
+                AND vec.rowid IN ({placeholders})
+                ORDER BY vec.distance
+                """,
+                [serialize_f32(query_vec), filter_size, *allowed_rowids],
+            ).fetchall()
+        else:
+            # Large filter: KNN-then-filter
+            search_k = min(max(top_k * 10, filter_size + top_k), total)
+            rows = db.execute(
+                """
+                SELECT vec.rowid, vec.distance, img.path, img.filename
+                FROM vec_embeddings vec
+                JOIN images img ON vec.rowid = img.rowid
+                WHERE vec.embedding MATCH ? AND k = ?
+                ORDER BY vec.distance
+                """,
+                [serialize_f32(query_vec), search_k],
+            ).fetchall()
+            rows = [r for r in rows if r[0] in allowed_rowids][:top_k]
+    else:
+        rows = db.execute(
+            """
+            SELECT vec.rowid, vec.distance, img.path, img.filename
+            FROM vec_embeddings vec
+            JOIN images img ON vec.rowid = img.rowid
+            WHERE vec.embedding MATCH ? AND k = ?
+            ORDER BY vec.distance
+            """,
+            [serialize_f32(query_vec), top_k],
+        ).fetchall()
+
+    db.close()
+    return rows
+
+
+# ─── LLM Query Planner ─────────────────────────────────────────────────────────
+
+_PLANNER_SYSTEM = """You are a photo search query planner. Decompose the user's natural language query into structured filters for searching a photo library.
+
+## Available Filter Fields
+
+- **persons**: list of person names from the known persons list below
+- **date_from**: ISO date string (YYYY-MM-DD), inclusive
+- **date_to**: ISO date string (YYYY-MM-DD), inclusive
+- **location**: free-text place name (will be geocoded to GPS bounds)
+- **semantic_query**: the visual/semantic part of the query (what the photo looks like)
+
+## Rules
+
+1. Extract person names from the query. If a name closely resembles a known person (e.g. partial match), include it anyway — fuzzy matching will be applied.
+2. Resolve relative dates to absolute dates (current date: {today}). Examples:
+   - "去年" → date_from={last_year}-01-01, date_to={last_year}-12-31
+   - "上个月" → previous month range
+   - "2023年夏天" → date_from=2023-06-01, date_to=2023-08-31
+3. Extract location names as-is (e.g., "西藏", "广州", "Lhasa").
+4. Put the visual/semantic description into semantic_query (e.g., "旅游", "birthday party", "sunset").
+5. If a field is not mentioned in the query, omit it from the output.
+6. Return ONLY a JSON object, no explanation.
+
+## Known Persons
+
+{persons}
+"""
+
+_PLANNER_MODEL = "minimax-2.7"
+
+
+def _extract_text_from_response(resp) -> str:
+    """Extract text from an Anthropic API response, skipping thinking blocks."""
+    for block in resp.content:
+        if block.type == "text":
+            return block.text
+    return ""
+
+
+def _get_known_persons() -> list[str]:
+    """Get list of known person names from the metadata DB."""
+    if not DB_PATH.exists():
+        return []
+    db = sqlite3.connect(str(DB_PATH))
+    try:
+        rows = db.execute(
+            "SELECT DISTINCT person_name FROM photo_persons ORDER BY person_name"
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        db.close()
+
+
+def _resolve_persons(query_persons: list[str]) -> list[str]:
+    """Resolve query person names to known persons with fuzzy matching.
+
+    For each name: exact match first, then edit-distance fallback on
+    shared surname+middle character. Returns resolved names; unmatched
+    names are dropped with a warning.
+    """
+    known = _get_known_persons()
+    resolved = []
+    for name in query_persons:
+        if name in known:
+            resolved.append(name)
+            continue
+        # Prefix match: "王耀" matches "王耀东", "王耀华", etc.
+        prefix_matches = [p for p in known if p.startswith(name) or name.startswith(p)]
+        if len(prefix_matches) == 1:
+            print(f"  [person] fuzzy match: {name!r} → {prefix_matches[0]!r}")
+            resolved.append(prefix_matches[0])
+            continue
+        if len(prefix_matches) > 1:
+            # Multiple prefix matches — ambiguous, skip
+            print(f"  [person] ambiguous match: {name!r} → {prefix_matches}, skipped")
+            continue
+        # Substring match as last resort
+        substr_matches = [p for p in known if name in p or p in name]
+        if len(substr_matches) == 1:
+            print(f"  [person] substring match: {name!r} → {substr_matches[0]!r}")
+            resolved.append(substr_matches[0])
+            continue
+        if len(substr_matches) > 1:
+            print(f"  [person] ambiguous substring: {name!r} → {substr_matches}, skipped")
+            continue
+        # Edit-distance fallback: find closest match within threshold
+        # Useful for single-character typos in Chinese names (e.g. 王耀军 vs 王耀东)
+        best_dist = len(name)
+        best_count = 0
+        best = None
+        for candidate in known:
+            if abs(len(candidate) - len(name)) > 1:
+                continue
+            dist = sum(a != b for a, b in zip(name, candidate))
+            extra = abs(len(name) - len(candidate))
+            dist += extra
+            if dist < best_dist:
+                best_dist = dist
+                best = candidate
+                best_count = 1
+            elif dist == best_dist:
+                best_count += 1
+        if best and best_dist <= 1 and best_count == 1:
+            print(f"  [person] edit-distance match: {name!r} → {best!r} (dist={best_dist})")
+            resolved.append(best)
+            continue
+        print(f"  [person] unknown: {name!r}, no match in {len(known)} known persons")
+    return resolved
+
+
+# Module-level LLM config (set by CLI args or env vars)
+_llm_base_url: str | None = None
+_llm_api_key: str | None = None
+
+
+def plan_query(query: str) -> dict:
+    """Use LLM to decompose a natural language query into structured filters.
+
+    Returns dict with optional keys: persons, date_from, date_to, location, semantic_query.
+    """
+    import anthropic
+    import datetime
+
+    today = datetime.date.today()
+    last_year = today.year - 1
+    persons = _get_known_persons()
+
+    system = _PLANNER_SYSTEM.format(
+        today=today.isoformat(),
+        last_year=last_year,
+        persons=", ".join(persons),
+    )
+
+    kwargs: dict = {}
+    if _llm_base_url:
+        kwargs["base_url"] = _llm_base_url
+    if _llm_api_key:
+        kwargs["api_key"] = _llm_api_key
+    client = anthropic.Anthropic(**kwargs)
+    resp = client.messages.create(
+        model=_PLANNER_MODEL,
+        max_tokens=500,
+        system=system,
+        messages=[{"role": "user", "content": query}],
+    )
+
+    import json
+
+    text = _extract_text_from_response(resp).strip()
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+    result = json.loads(text)
+    print(f"  [planner] {query} → {result}")
+    return result
+
+
+def _plan_to_filters(plan: dict) -> tuple[set[int] | None, str, str]:
+    """Convert planner output to (allowed_rowids, semantic_query, warning).
+
+    Returns (rowid_set or None, semantic_query_string, warning_string).
+    """
+    raw_persons = plan.get("persons")
+    date_from_str = plan.get("date_from")
+    date_to_str = plan.get("date_to")
+    location = plan.get("location")
+    semantic = plan.get("semantic_query", "")
+
+    # Build semantic query from the parts
+    parts = [semantic]
+    if location:
+        parts.append(location)
+    semantic_full = " ".join(p for p in parts if p)
+
+    # Resolve person names with fuzzy matching
+    persons = _resolve_persons(raw_persons) if raw_persons else None
+    person_warning = ""
+    if raw_persons and not persons:
+        names_str = ", ".join(raw_persons)
+        person_warning = f"⚠ Person not found: {names_str}. "
+
+    # Resolve date filters
+    ts_from = _parse_date(date_from_str, start_of_day=True) if date_from_str else None
+    ts_to = _parse_date(date_to_str, start_of_day=False) if date_to_str else None
+
+    # Resolve location to GPS bounds
+    lat_range = lon_range = None
+    if location:
+        lat_range, lon_range = _geocode(location)
+
+    # Apply filters
+    has_filter = any(v is not None and v != [] for v in [
+        persons, ts_from, ts_to, lat_range
+    ])
+
+    if not has_filter:
+        return None, semantic_full, person_warning
+
+    db = sqlite3.connect(str(DB_PATH))
+    filter_kwargs: dict = {}
+    if persons:
+        filter_kwargs["persons"] = persons
+    if ts_from is not None:
+        filter_kwargs["date_from"] = ts_from
+    if ts_to is not None:
+        filter_kwargs["date_to"] = ts_to
+    if lat_range is not None:
+        filter_kwargs["lat_min"] = lat_range[0]
+        filter_kwargs["lat_max"] = lat_range[1]
+    if lon_range is not None:
+        filter_kwargs["lon_min"] = lon_range[0]
+        filter_kwargs["lon_max"] = lon_range[1]
+
+    rowids = _metadata_filter(db, **filter_kwargs)
+    db.close()
+    return rowids, semantic_full, person_warning
+
+
+def _geocode(place_name: str) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Geocode a place name to (lat_min, lat_max), (lon_min, lon_max) bounding box.
+
+    Uses Nominatim (OpenStreetMap) free geocoding API.
+    """
+    import json
+    import urllib.request
+    import urllib.parse
+
+    url = (
+        "https://nominatim.openstreetmap.org/search?"
+        + urllib.parse.urlencode({
+            "q": place_name,
+            "format": "json",
+            "limit": 1,
+            "polygon_text": 0,
+        })
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "img-search/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            results = json.loads(resp.read())
+    except Exception as e:
+        print(f"  [geocode] failed for '{place_name}': {e}")
+        return None
+
+    if not results:
+        print(f"  [geocode] no results for '{place_name}'")
+        return None
+
+    r = results[0]
+    lat = float(r["lat"])
+    lon = float(r["lon"])
+    bb = r.get("boundingbox")
+    if bb and len(bb) == 4:
+        # boundingbox: [south, north, west, east]
+        # Expand by ±0.01° (~1km) to capture nearby photos
+        pad = 0.01
+        lat_range = (float(bb[0]) - pad, float(bb[1]) + pad)
+        lon_range = (float(bb[2]) - pad, float(bb[3]) + pad)
+    else:
+        # Fallback: ±0.5 degree radius
+        lat_range = (lat - 0.5, lat + 0.5)
+        lon_range = (lon - 0.5, lon + 0.5)
+
+    print(f"  [geocode] {place_name} → lat[{lat_range[0]:.2f},{lat_range[1]:.2f}] lon[{lon_range[0]:.2f},{lon_range[1]:.2f}]")
+    return lat_range, lon_range
+
+
+def _parse_metadata_filters(
+    person_filter: str = "",
+    date_from: str = "",
+    date_to: str = "",
+) -> set[int] | None:
+    """Parse UI filter inputs into a set of allowed rowids, or None if no filters."""
+    persons = [p.strip() for p in person_filter.split(",") if p.strip()] if person_filter else []
+    ts_from = _parse_date(date_from, start_of_day=True) if date_from else None
+    ts_to = _parse_date(date_to, start_of_day=False) if date_to else None
+
+    if not persons and ts_from is None and ts_to is None:
+        return None
+
+    db = sqlite3.connect(str(DB_PATH))
+    rowids = _metadata_filter(db, persons=persons or None, date_from=ts_from, date_to=ts_to)
+    db.close()
+    return rowids
+
+
+def _parse_date(date_str: str, start_of_day: bool = True) -> float | None:
+    """Parse YYYY-MM-DD to Apple Core Data timestamp (UTC-based)."""
+    import datetime
+
+    try:
+        dt = datetime.datetime.strptime(date_str.strip(), "%Y-%m-%d")
+        if not start_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        unix_ts = dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+        return unix_ts - CORE_DATA_EPOCH
+    except (ValueError, TypeError):
+        return None
+
+
 # ─── Serve Command ─────────────────────────────────────────────────────────────
+
+
+def cmd_smart_search(
+    query: str,
+    top_k: int = 10,
+    no_rerank: bool = False,
+    device: str | None = None,
+):
+    """Search with LLM-powered query planning."""
+    from sentence_transformers import CrossEncoder, SentenceTransformer
+
+    dev = resolve_device(device)
+    print(f"Device: {dev}")
+
+    db = init_db()
+    total = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+    db.close()
+    if total == 0:
+        print("No images in database. Run 'embed <path>' first.")
+        return
+
+    # Step 1: LLM query planning
+    print(f"\nQuery: {query}")
+    print("─" * 70)
+    plan = plan_query(query)
+    print(f"Plan: {plan}")
+
+    # Step 2: Convert plan to filters + semantic query
+    filter_rowids, semantic_query, warning = _plan_to_filters(plan)
+    if warning:
+        print(f"Warning: {warning}")
+    if filter_rowids is not None:
+        print(f"Metadata filter: {len(filter_rowids)} candidates")
+
+    search_text = semantic_query or query
+    print(f"Semantic search: '{search_text}'")
+
+    # Step 3: Load embedding model and search
+    mp = model_path(EMBEDDING_MODEL_ID)
+    print(f"Loading embedding model from: {mp} ...")
+    embed_model = SentenceTransformer(
+        mp,
+        cache_folder=str(MODEL_DIR),
+        device=dev,
+        model_kwargs={"torch_dtype": _model_dtype(dev)},
+    )
+
+    query_emb = embed_model.encode(
+        [search_text], normalize_embeddings=True, show_progress_bar=False
+    )
+    rows = _knn_search_filtered(
+        query_emb[0], max(top_k, _RERANK_S1_K), filter_rowids
+    )
+
+    if not rows:
+        print("No results found")
+        return
+
+    if no_rerank:
+        ranked = _rerank(search_text, rows, mode="none", rerank_k=top_k)
+    else:
+        mp = model_path(RERANKER_MODEL_ID)
+        print(f"Loading reranker model from: {mp} ...")
+        reranker = CrossEncoder(
+            mp,
+            cache_folder=str(MODEL_DIR),
+            device=dev,
+            model_kwargs={"torch_dtype": _model_dtype(dev)},
+        )
+        ranked = _rerank(search_text, rows, reranker)
+
+    for rank, (score, path, filename) in enumerate(ranked, 1):
+        marker = ">>>" if rank == 1 else "   "
+        print(f"  {marker} #{rank:<3} score={score:.4f}  {path}")
+
+    print("─" * 70)
 
 
 def cmd_serve(
@@ -631,11 +1370,21 @@ def cmd_serve(
         s1_k: int,
         s2_k: int,
         rerank_k: int,
+        person_filter: str,
+        date_from: str,
+        date_to: str,
     ):
         if not text_query and image_file is None:
             return [], "Please enter a text query or upload an image."
 
         t0 = time.perf_counter()
+
+        # Build metadata filters
+        filter_rowids = _parse_metadata_filters(
+            person_filter, date_from, date_to
+        )
+        if filter_rowids is not None:
+            print(f"  [filter] metadata pre-filter: {len(filter_rowids)} candidates")
 
         # Build query vector
         if image_file is not None:
@@ -651,7 +1400,7 @@ def cmd_serve(
 
         t1 = time.perf_counter()
         knn_k = max(s1_k, rerank_k)
-        rows = _knn_search(query_vec, knn_k)
+        rows = _knn_search_filtered(query_vec, knn_k, filter_rowids)
         print(f"  [timing] vector search (k={knn_k}): {time.perf_counter() - t1:.3f}s")
         if not rows:
             return [], "No results found."
@@ -683,6 +1432,48 @@ def cmd_serve(
             for i, item in enumerate(ranked)
         ]
         summary = f"Found {len(ranked)} results in {elapsed:.1f}s"
+        return gallery, summary
+
+    def do_smart_search(text_query: str, rerank_mode: str, rerank_k: int):
+        """Smart search using LLM query planning."""
+        if not text_query:
+            return [], "Please enter a query."
+
+        t0 = time.perf_counter()
+
+        # Step 1: LLM plan
+        try:
+            plan = plan_query(text_query)
+        except Exception as e:
+            return [], f"Query planning failed: {e}"
+
+        filter_rowids, semantic_query, warning = _plan_to_filters(plan)
+        search_text = semantic_query or text_query
+
+        filter_info = f" | {len(filter_rowids)} candidates" if filter_rowids else ""
+        plan_str = ", ".join(f"{k}={v}" for k, v in plan.items() if v)
+        warn_prefix = warning or ""
+
+        # Step 2: Embed and search
+        query_emb = embed_model.encode(
+            [search_text], normalize_embeddings=True, show_progress_bar=False
+        )
+        rows = _knn_search_filtered(query_emb[0], max(rerank_k, _RERANK_S1_K), filter_rowids)
+        if not rows:
+            return [], f"No results. Plan: {plan_str}"
+
+        effective_mode = rerank_mode if reranker is not None else "none"
+        ranked = _rerank(
+            search_text, rows, reranker,
+            mode=effective_mode, s1_k=_RERANK_S1_K, s2_k=_RERANK_S2_K, rerank_k=rerank_k,
+        )
+
+        elapsed = time.perf_counter() - t0
+        gallery = [
+            (_ensure_browser_compatible(item[1]), f"#{i + 1}  score: {item[0]:.4f}")
+            for i, item in enumerate(ranked)
+        ]
+        summary = f"{warn_prefix}Found {len(ranked)} in {elapsed:.1f}s | {plan_str}{filter_info}"
         return gallery, summary
 
     with gr.Blocks(title="Image Search") as app:
@@ -739,9 +1530,32 @@ def cmd_serve(
                     )
                 with gr.Row(elem_classes=["search-row"]):
                     search_btn = gr.Button(
-                        "\U0001f50d Search", variant="primary", scale=0, min_width=180
+                        "\U0001f50d Search", variant="primary", scale=0, min_width=120
+                    )
+                    smart_btn = gr.Button(
+                        "\U0001f9e0 Smart", variant="secondary", scale=0, min_width=120
                     )
                     status = gr.Markdown("", elem_classes=["search-status"])
+                # Metadata filter row
+                with gr.Row():
+                    person_input = gr.Textbox(
+                        label="Person",
+                        placeholder="e.g. 王梓涵 (comma-sep for multiple)",
+                        scale=2,
+                        show_label=True,
+                    )
+                    date_from_input = gr.Textbox(
+                        label="From",
+                        placeholder="YYYY-MM-DD",
+                        scale=1,
+                        show_label=True,
+                    )
+                    date_to_input = gr.Textbox(
+                        label="To",
+                        placeholder="YYYY-MM-DD",
+                        scale=1,
+                        show_label=True,
+                    )
             # Col 2: image input (2/7)
             image_input = gr.Image(
                 label="Image",
@@ -800,7 +1614,16 @@ def cmd_serve(
                 s1_k_input,
                 s2_k_input,
                 rerank_k_input,
+                person_input,
+                date_from_input,
+                date_to_input,
             ],
+            outputs=[gallery, status],
+        )
+
+        smart_btn.click(
+            fn=do_smart_search,
+            inputs=[text_input, rerank_mode, rerank_k_input],
             outputs=[gallery, status],
         )
 
@@ -814,6 +1637,13 @@ def cmd_serve(
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────────
+
+
+def _set_llm_config(args):
+    """Set module-level LLM config from CLI args, falling back to env vars."""
+    global _llm_base_url, _llm_api_key
+    _llm_base_url = getattr(args, "llm_base_url", None) or os.environ.get("ANTHROPIC_BASE_URL")
+    _llm_api_key = getattr(args, "llm_api_key", None) or os.environ.get("ANTHROPIC_API_KEY")
 
 
 def main():
@@ -844,6 +1674,20 @@ def main():
     srch.add_argument(
         "--device", help="Compute device: cuda, mps, cpu (default: auto-detect)"
     )
+    srch.add_argument("--person", help="Filter by person name (comma-sep for multiple)")
+    srch.add_argument("--date-from", help="Filter: start date (YYYY-MM-DD)")
+    srch.add_argument("--date-to", help="Filter: end date (YYYY-MM-DD)")
+
+    idx = sub.add_parser("index-photos", help="Index Apple Photos metadata")
+    idx.add_argument("library_path", help="Path to .photoslibrary bundle")
+
+    smart = sub.add_parser("smart-search", help="NL search with LLM query planning")
+    smart.add_argument("query", help="Natural language query (e.g. '王梓涵去年在广州的照片')")
+    smart.add_argument("--top-k", type=int, default=10, help="Number of results")
+    smart.add_argument("--no-rerank", action="store_true", help="Skip reranking")
+    smart.add_argument("--device", help="Compute device: cuda, mps, cpu")
+    smart.add_argument("--llm-base-url", help="Anthropic-compatible API base URL")
+    smart.add_argument("--llm-api-key", help="API key for the LLM service")
 
     srv = sub.add_parser("serve", help="Launch web UI for image search")
     srv.add_argument(
@@ -857,21 +1701,37 @@ def main():
     srv.add_argument(
         "--device", help="Compute device: cuda, mps, cpu (default: auto-detect)"
     )
+    srv.add_argument("--llm-base-url", help="Anthropic-compatible API base URL")
+    srv.add_argument("--llm-api-key", help="API key for the LLM service")
 
     args = parser.parse_args()
 
     if args.command == "embed":
         cmd_embed(args.path, device=getattr(args, "device", None))
+    elif args.command == "index-photos":
+        cmd_index_photos(args.library_path)
     elif args.command == "search":
         cmd_search(
             args.desc,
             top_k=args.top_k,
             no_rerank=args.no_rerank,
             device=getattr(args, "device", None),
+            person=getattr(args, "person", None),
+            date_from=getattr(args, "date_from", None),
+            date_to=getattr(args, "date_to", None),
         )
     elif args.command == "serve":
+        _set_llm_config(args)
         cmd_serve(
             port=args.port,
+            no_rerank=args.no_rerank,
+            device=getattr(args, "device", None),
+        )
+    elif args.command == "smart-search":
+        _set_llm_config(args)
+        cmd_smart_search(
+            args.query,
+            top_k=args.top_k,
             no_rerank=args.no_rerank,
             device=getattr(args, "device", None),
         )
