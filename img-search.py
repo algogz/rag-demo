@@ -321,6 +321,8 @@ _GALLERY_CSS = """
 .rerank-row fieldset > div { flex-direction: row !important; flex-wrap: nowrap !important; gap: 8px !important; }
 /* Compact number inputs */
 .compact-num input { padding: 4px 6px !important; font-size: 0.85em !important; height: 32px !important; }
+.search-row { gap: 12px !important; align-items: center !important; }
+.search-status { font-size: 0.85em !important; opacity: 0.7; }
 """
 
 _GALLERY_JS = """
@@ -735,9 +737,11 @@ def cmd_serve(
                         min_width=90,
                         elem_classes=["compact-num"],
                     )
-                search_btn = gr.Button(
-                    "\U0001f50d Search", variant="primary", scale=0, min_width=90
-                )
+                with gr.Row(elem_classes=["search-row"]):
+                    search_btn = gr.Button(
+                        "\U0001f50d Search", variant="primary", scale=0, min_width=180
+                    )
+                    status = gr.Markdown("", elem_classes=["search-status"])
             # Col 2: image input (2/7)
             image_input = gr.Image(
                 label="Image",
@@ -747,8 +751,6 @@ def cmd_serve(
                 sources=["upload"],
                 elem_classes=["image-upload"],
             )
-
-        status = gr.Markdown("")
 
         # Show/hide Stage 2 control based on mode
         rerank_mode.change(
