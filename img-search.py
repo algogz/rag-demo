@@ -311,6 +311,16 @@ _GALLERY_CSS = """
     line-height: 1;
     cursor: pointer;
 }
+/* ===== Compact top panel ===== */
+.top-bar { gap: 8px !important; align-items: stretch !important; }
+.top-bar .image-upload { height: 100% !important; }
+.top-bar .image-upload > div { height: 100% !important; min-height: unset !important; }
+/* ===== Compact rerank row ===== */
+.rerank-row { gap: 8px !important; }
+/* Force radio buttons horizontal */
+.rerank-row fieldset > div { flex-direction: row !important; flex-wrap: nowrap !important; gap: 8px !important; }
+/* Compact number inputs */
+.compact-num input { padding: 4px 6px !important; font-size: 0.85em !important; height: 32px !important; }
 """
 
 _GALLERY_JS = """
@@ -440,7 +450,9 @@ def _rerank(
     if mode == "1-stage":
         candidates = rows[:s1_k]
         t0 = time.perf_counter()
-        scores = _score_pairs(query, candidates, reranker, _RERANK_S2_PIXELS, batch_size=10)
+        scores = _score_pairs(
+            query, candidates, reranker, _RERANK_S2_PIXELS, batch_size=10
+        )
         print(
             f"    [timing] 1-stage ({len(candidates)} imgs @ 672px): {time.perf_counter() - t0:.3f}s"
         )
@@ -454,7 +466,9 @@ def _rerank(
     # 2-stage
     s1_candidates = rows[:s1_k]
     t1 = time.perf_counter()
-    s1_scores = _score_pairs(query, s1_candidates, reranker, _RERANK_S1_PIXELS, batch_size=20)
+    s1_scores = _score_pairs(
+        query, s1_candidates, reranker, _RERANK_S1_PIXELS, batch_size=20
+    )
     print(
         f"    [timing] stage1 ({len(s1_candidates)} imgs @ 336px): {time.perf_counter() - t1:.3f}s"
     )
@@ -466,7 +480,9 @@ def _rerank(
 
     s2_candidates = [row for _, row in s1_ranked[:s2_k]]
     t2 = time.perf_counter()
-    s2_scores = _score_pairs(query, s2_candidates, reranker, _RERANK_S2_PIXELS, batch_size=10)
+    s2_scores = _score_pairs(
+        query, s2_candidates, reranker, _RERANK_S2_PIXELS, batch_size=10
+    )
     print(
         f"    [timing] stage2 ({len(s2_candidates)} imgs @ 672px): {time.perf_counter() - t2:.3f}s"
     )
@@ -667,38 +683,72 @@ def cmd_serve(
         summary = f"Found {len(ranked)} results in {elapsed:.1f}s"
         return gallery, summary
 
-    with gr.Blocks(title="Image Search", css=_GALLERY_CSS, js=_GALLERY_JS) as app:
-        gr.Markdown("### Image Semantic Search")
+    with gr.Blocks(title="Image Search") as app:
+        # gr.Markdown("### Image Semantic Search")
 
-        with gr.Row():
-            text_input = gr.Textbox(
-                label="Query",
-                placeholder="Describe what you're looking for...",
-                scale=4,
-            )
+        # --- Top input panel ---
+        with gr.Row(elem_classes=["top-bar"]):
+            # Col 1: query + rerank controls (5/7)
+            with gr.Column(scale=5, min_width=300):
+                text_input = gr.Textbox(
+                    label="Query",
+                    placeholder="Describe what you're looking for...",
+                    lines=1,
+                    max_lines=2,
+                    show_label=False,
+                )
+                with gr.Row(elem_classes=["rerank-row"]):
+                    rerank_mode = gr.Radio(
+                        choices=["2-stage", "1-stage", "None"],
+                        value="2-stage",
+                        label="Rerank",
+                        show_label=True,
+                        scale=3,
+                    )
+                    s1_k_input = gr.Number(
+                        value=_RERANK_S1_K,
+                        label="Candidates",
+                        minimum=5,
+                        maximum=100,
+                        step=5,
+                        scale=1,
+                        min_width=90,
+                        elem_classes=["compact-num"],
+                    )
+                    s2_k_input = gr.Number(
+                        value=_RERANK_S2_K,
+                        label="Stage 2",
+                        minimum=5,
+                        maximum=50,
+                        step=5,
+                        scale=1,
+                        min_width=90,
+                        elem_classes=["compact-num"],
+                    )
+                    rerank_k_input = gr.Number(
+                        value=10,
+                        label="Results",
+                        minimum=1,
+                        maximum=50,
+                        step=1,
+                        scale=1,
+                        min_width=90,
+                        elem_classes=["compact-num"],
+                    )
+                search_btn = gr.Button(
+                    "\U0001f50d Search", variant="primary", scale=0, min_width=90
+                )
+            # Col 2: image input (2/7)
             image_input = gr.Image(
-                label="Image", type="filepath", height=80, scale=1, show_label=True
-            )
-            search_btn = gr.Button("Search", variant="primary", scale=0, min_width=80)
-
-        with gr.Row():
-            rerank_mode = gr.Radio(
-                choices=["2-stage", "1-stage", "None"],
-                value="2-stage",
-                label="Rerank",
+                label="Image",
+                type="filepath",
+                scale=2,
                 show_label=True,
-                scale=1,
+                sources=["upload"],
+                elem_classes=["image-upload"],
             )
-            s1_k_input = gr.Number(
-                value=_RERANK_S1_K, label="Candidates", minimum=5, maximum=100, step=5, scale=0, min_width=90
-            )
-            s2_k_input = gr.Number(
-                value=_RERANK_S2_K, label="Stage 2", minimum=5, maximum=50, step=5, scale=0, min_width=90
-            )
-            rerank_k_input = gr.Number(
-                value=10, label="Results", minimum=1, maximum=50, step=1, scale=0, min_width=90
-            )
-            status = gr.Markdown("")
+
+        status = gr.Markdown("")
 
         # Show/hide Stage 2 control based on mode
         rerank_mode.change(
@@ -734,19 +784,31 @@ def cmd_serve(
         gallery = gr.Gallery(
             label="Results (click image to zoom)",
             columns=5,
-            height=800,
+            height="85vh",
             object_fit="contain",
             show_label=True,
         )
 
         search_btn.click(
             fn=do_search,
-            inputs=[text_input, image_input, rerank_mode, s1_k_input, s2_k_input, rerank_k_input],
+            inputs=[
+                text_input,
+                image_input,
+                rerank_mode,
+                s1_k_input,
+                s2_k_input,
+                rerank_k_input,
+            ],
             outputs=[gallery, status],
         )
 
     print(f"\nLaunching at http://localhost:{port}")
-    app.launch(server_port=port, allowed_paths=list(dirs) + [str(heic_cache)])
+    app.launch(
+        server_port=port,
+        allowed_paths=list(dirs) + [str(heic_cache)],
+        css=_GALLERY_CSS,
+        js=_GALLERY_JS,
+    )
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────────
