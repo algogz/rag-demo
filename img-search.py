@@ -805,6 +805,7 @@ def cmd_index_photos(library_path: str):
 def _metadata_filter(
     db: sqlite3.Connection,
     persons: list[str] | None = None,
+    person_match: str = "all",
     date_from: float | None = None,
     date_to: float | None = None,
     lat_min: float | None = None,
@@ -822,9 +823,16 @@ def _metadata_filter(
 
     if persons:
         placeholders = ",".join("?" * len(persons))
-        conditions.append(
-            f"rowid IN (SELECT rowid FROM photo_persons WHERE person_name IN ({placeholders}))"
-        )
+        if len(persons) == 1 or person_match == "any":
+            # OR: match photos with any of the listed persons
+            conditions.append(
+                f"rowid IN (SELECT rowid FROM photo_persons WHERE person_name IN ({placeholders}))"
+            )
+        else:
+            # AND: match photos with ALL listed persons
+            conditions.append(
+                f"rowid IN (SELECT rowid FROM photo_persons WHERE person_name IN ({placeholders}) GROUP BY rowid HAVING COUNT(DISTINCT person_name) = {len(persons)})"
+            )
         params.extend(persons)
 
     if date_from is not None:
@@ -895,7 +903,7 @@ def _knn_search_filtered(
             ).fetchall()
         else:
             # Large filter: KNN-then-filter
-            search_k = min(max(top_k * 10, filter_size + top_k), total)
+            search_k = min(max(top_k * 10, filter_size + top_k), total, 4096)
             rows = db.execute(
                 """
                 SELECT vec.rowid, vec.distance, img.path, img.filename
@@ -930,6 +938,7 @@ _PLANNER_SYSTEM = """You are a photo search query planner. Decompose the user's 
 ## Available Filter Fields
 
 - **persons**: list of person names from the known persons list below
+- **person_match**: "all" or "any" — whether ALL persons must appear in the same photo, or ANY one is enough. Default "all". Use "all" for queries like "A和B的合照" (photos with both A and B). Use "any" for queries like "A或B的照片" (photos with A or B).
 - **date_from**: ISO date string (YYYY-MM-DD), inclusive
 - **date_to**: ISO date string (YYYY-MM-DD), inclusive
 - **location**: free-text place name (will be geocoded to GPS bounds)
@@ -972,7 +981,7 @@ def _get_known_persons() -> list[str]:
         rows = db.execute(
             "SELECT DISTINCT person_name FROM photo_persons ORDER BY person_name"
         ).fetchall()
-        return [r[0] for r in rows]
+        return [r[0] for r in rows if r[0]]
     finally:
         db.close()
 
@@ -1088,6 +1097,7 @@ def _plan_to_filters(plan: dict) -> tuple[set[int] | None, str, str]:
     Returns (rowid_set or None, semantic_query_string, warning_string).
     """
     raw_persons = plan.get("persons")
+    person_match = plan.get("person_match", "all")
     date_from_str = plan.get("date_from")
     date_to_str = plan.get("date_to")
     location = plan.get("location")
@@ -1127,6 +1137,7 @@ def _plan_to_filters(plan: dict) -> tuple[set[int] | None, str, str]:
     filter_kwargs: dict = {}
     if persons:
         filter_kwargs["persons"] = persons
+        filter_kwargs["person_match"] = person_match
     if ts_from is not None:
         filter_kwargs["date_from"] = ts_from
     if ts_to is not None:
@@ -1370,21 +1381,11 @@ def cmd_serve(
         s1_k: int,
         s2_k: int,
         rerank_k: int,
-        person_filter: str,
-        date_from: str,
-        date_to: str,
     ):
         if not text_query and image_file is None:
             return [], "Please enter a text query or upload an image."
 
         t0 = time.perf_counter()
-
-        # Build metadata filters
-        filter_rowids = _parse_metadata_filters(
-            person_filter, date_from, date_to
-        )
-        if filter_rowids is not None:
-            print(f"  [filter] metadata pre-filter: {len(filter_rowids)} candidates")
 
         # Build query vector
         if image_file is not None:
@@ -1400,7 +1401,7 @@ def cmd_serve(
 
         t1 = time.perf_counter()
         knn_k = max(s1_k, rerank_k)
-        rows = _knn_search_filtered(query_vec, knn_k, filter_rowids)
+        rows = _knn_search_filtered(query_vec, knn_k, None)
         print(f"  [timing] vector search (k={knn_k}): {time.perf_counter() - t1:.3f}s")
         if not rows:
             return [], "No results found."
@@ -1469,6 +1470,8 @@ def cmd_serve(
         )
 
         elapsed = time.perf_counter() - t0
+        print(f"  [timing] total: {elapsed:.3f}s")
+
         gallery = [
             (_ensure_browser_compatible(item[1]), f"#{i + 1}  score: {item[0]:.4f}")
             for i, item in enumerate(ranked)
@@ -1536,26 +1539,6 @@ def cmd_serve(
                         "\U0001f9e0 Smart", variant="secondary", scale=0, min_width=120
                     )
                     status = gr.Markdown("", elem_classes=["search-status"])
-                # Metadata filter row
-                with gr.Row():
-                    person_input = gr.Textbox(
-                        label="Person",
-                        placeholder="e.g. 王梓涵 (comma-sep for multiple)",
-                        scale=2,
-                        show_label=True,
-                    )
-                    date_from_input = gr.Textbox(
-                        label="From",
-                        placeholder="YYYY-MM-DD",
-                        scale=1,
-                        show_label=True,
-                    )
-                    date_to_input = gr.Textbox(
-                        label="To",
-                        placeholder="YYYY-MM-DD",
-                        scale=1,
-                        show_label=True,
-                    )
             # Col 2: image input (2/7)
             image_input = gr.Image(
                 label="Image",
@@ -1614,9 +1597,6 @@ def cmd_serve(
                 s1_k_input,
                 s2_k_input,
                 rerank_k_input,
-                person_input,
-                date_from_input,
-                date_to_input,
             ],
             outputs=[gallery, status],
         )
