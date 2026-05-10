@@ -1123,7 +1123,9 @@ def _plan_to_filters(plan: dict) -> tuple[set[int] | None, str, str]:
     # Resolve location to GPS bounds
     lat_range = lon_range = None
     if location:
-        lat_range, lon_range = _geocode(location)
+        result = _geocode(location)
+        if result:
+            lat_range, lon_range = result
 
     # Apply filters
     has_filter = any(v is not None and v != [] for v in [
@@ -1154,52 +1156,96 @@ def _plan_to_filters(plan: dict) -> tuple[set[int] | None, str, str]:
     return rowids, semantic_full, person_warning
 
 
+_geocode_cache: dict[str, tuple[tuple[float, float], tuple[float, float]] | None] = {}
+_geocode_last_request: float = 0.0
+
+
 def _geocode(place_name: str) -> tuple[tuple[float, float], tuple[float, float]] | None:
     """Geocode a place name to (lat_min, lat_max), (lon_min, lon_max) bounding box.
 
     Uses Nominatim (OpenStreetMap) free geocoding API.
+    Caches results and enforces 1 req/s rate limit per Nominatim policy.
     """
     import json
+    import time
     import urllib.request
     import urllib.parse
 
-    url = (
-        "https://nominatim.openstreetmap.org/search?"
-        + urllib.parse.urlencode({
-            "q": place_name,
-            "format": "json",
-            "limit": 1,
-            "polygon_text": 0,
-        })
+    if place_name in _geocode_cache:
+        cached = _geocode_cache[place_name]
+        if cached:
+            lat_km = (cached[0][1] - cached[0][0]) * 111
+            lon_km = (cached[1][1] - cached[1][0]) * 111 * abs(((cached[0][0] + cached[0][1]) / 2) * 3.14159 / 180)
+            print(f"  [geocode] {place_name} → lat[{cached[0][0]:.2f},{cached[0][1]:.2f},{lat_km:.0f}km] lon[{cached[1][0]:.2f},{cached[1][1]:.2f},{lon_km:.0f}km] (cached)")
+        return cached
+
+    # Enforce Nominatim rate limit: max 1 request per second
+    global _geocode_last_request
+    elapsed = time.monotonic() - _geocode_last_request
+    if elapsed < 1.1:
+        time.sleep(1.1 - elapsed)
+
+    params = urllib.parse.urlencode({
+        "q": place_name,
+        "format": "json",
+        "limit": 5,
+        "polygon_text": 0,
+        "accept-language": "zh",
+        "countrycodes": "cn",
+    })
+    req = urllib.request.Request(
+        f"https://nominatim.openstreetmap.org/search?{params}",
+        headers={"User-Agent": "img-search/1.0"},
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "img-search/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            results = json.loads(resp.read())
-    except Exception as e:
-        print(f"  [geocode] failed for '{place_name}': {e}")
-        return None
+    results = None
+    for attempt in range(3):
+        try:
+            import ssl
+            ctx = ssl.create_default_context()
+            _geocode_last_request = time.monotonic()
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                results = json.loads(resp.read())
+            break
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1.1)
+                continue
+            print(f"  [geocode] failed for '{place_name}': {e}")
+            _geocode_cache[place_name] = None
+            return None
 
     if not results:
         print(f"  [geocode] no results for '{place_name}'")
+        _geocode_cache[place_name] = None
         return None
 
+    # Pick best result: prefer higher importance, then presence of bounding box
+    results.sort(key=lambda r: (
+        float(r.get("importance") or 0),
+        bool(r.get("boundingbox")),
+    ), reverse=True)
     r = results[0]
     lat = float(r["lat"])
     lon = float(r["lon"])
     bb = r.get("boundingbox")
     if bb and len(bb) == 4:
         # boundingbox: [south, north, west, east]
-        # Expand by ±0.01° (~1km) to capture nearby photos
-        pad = 0.01
-        lat_range = (float(bb[0]) - pad, float(bb[1]) + pad)
-        lon_range = (float(bb[2]) - pad, float(bb[3]) + pad)
+        # Expand by 20% on each side (min 0.1° ≈ 10km) to capture nearby photos
+        lat_span = float(bb[1]) - float(bb[0])
+        lon_span = float(bb[3]) - float(bb[2])
+        pad_lat = max(0.1, lat_span * 0.2)
+        pad_lon = max(0.1, lon_span * 0.2)
+        lat_range = (float(bb[0]) - pad_lat, float(bb[1]) + pad_lat)
+        lon_range = (float(bb[2]) - pad_lon, float(bb[3]) + pad_lon)
     else:
         # Fallback: ±0.5 degree radius
         lat_range = (lat - 0.5, lat + 0.5)
         lon_range = (lon - 0.5, lon + 0.5)
 
-    print(f"  [geocode] {place_name} → lat[{lat_range[0]:.2f},{lat_range[1]:.2f}] lon[{lon_range[0]:.2f},{lon_range[1]:.2f}]")
+    lat_km = (lat_range[1] - lat_range[0]) * 111
+    lon_km = (lon_range[1] - lon_range[0]) * 111 * abs(((lat_range[0] + lat_range[1]) / 2) * 3.14159 / 180)
+    print(f"  [geocode] {place_name} → lat[{lat_range[0]:.2f},{lat_range[1]:.2f},{lat_km:.0f}km] lon[{lon_range[0]:.2f},{lon_range[1]:.2f},{lon_km:.0f}km]")
+    _geocode_cache[place_name] = (lat_range, lon_range)
     return lat_range, lon_range
 
 
